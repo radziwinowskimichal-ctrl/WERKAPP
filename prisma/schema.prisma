@@ -1,0 +1,416 @@
+// prisma/schema.prisma
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// 1. Użytkownicy i Role (Zarządzanie Personelem)
+// ==========================================
+
+model Role {
+  id               String @id @default(uuid())
+  name             String @unique // np. Admin, Workshop_Manager, Office, Mechanic
+  permissions_json Json // Flagi uprawnień, np. {"can_see_finances": false}
+
+  users User[]
+}
+
+model User {
+  id            String   @id @default(uuid())
+  role_id       String
+  first_name    String
+  last_name     String
+  email         String   @unique
+  password_hash String
+  is_active     Boolean  @default(true)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  role           Role               @relation(fields: [role_id], references: [id])
+  internal_rates UserInternalRate[]
+
+  // Relacje odwrotne
+  protocols_created Protocol[]
+  time_logs         TimeLog[]
+  part_requests     PartRequest[]
+  media_uploaded    MediaFile[]
+  work_orders       WorkOrderMechanic[]
+}
+
+model UserInternalRate {
+  id          String    @id @default(uuid())
+  user_id     String
+  hourly_cost Decimal   @db.Decimal(10, 2)
+  valid_from  DateTime
+  valid_to    DateTime?
+
+  user User @relation(fields: [user_id], references: [id])
+}
+
+// ==========================================
+// 2. Baza Klientów (Jednolity CRM)
+// ==========================================
+
+enum ClientType {
+  B2B
+  B2C
+}
+
+model Client {
+  id                       String     @id @default(uuid())
+  type                     ClientType
+  company_name             String?
+  first_name               String?
+  last_name                String?
+  tax_number               String? // Steuernummer / USt-IdNr.
+  address_street           String?
+  address_zip              String?
+  address_city             String?
+  billing_discount_percent Decimal    @default(0.00) @db.Decimal(5, 2)
+  credit_limit             Decimal    @default(0.00) @db.Decimal(10, 2)
+  created_at               DateTime   @default(now())
+
+  owned_vehicles Vehicle[]
+  rentals        Rental[]
+  invoices       Invoice[]
+  work_orders    WorkOrder[]
+
+  // Wymagany Full-Text Search na nazwie, nazwisku i NIP (PostgreSQL index)
+  @@index([first_name, last_name, tax_number, company_name])
+}
+
+// ==========================================
+// 3. Flota i Pojazdy
+// ==========================================
+
+model VehicleCategory {
+  id          String  @id @default(uuid())
+  name        String // np. Mała przyczepa, Budowlana, Koparka
+  description String?
+
+  vehicles Vehicle[]
+}
+
+model Vehicle {
+  id                    String    @id @default(uuid())
+  owner_client_id       String? // NULL dla własnej floty
+  category_id           String
+  license_plate         String    @unique
+  vin                   String    @unique
+  serial_number         String?
+  make                  String?
+  model                 String?
+  production_year       Int?
+  tuv_valid_until       DateTime?
+  uvv_valid_until       DateTime?
+  insurance_valid_until DateTime?
+  purchase_date         DateTime?
+  purchase_price_net    Decimal?  @db.Decimal(10, 2)
+  created_at            DateTime  @default(now())
+
+  owner        Client?             @relation(fields: [owner_client_id], references: [id])
+  category     VehicleCategory     @relation(fields: [category_id], references: [id])
+  rental_price VehicleRentalPrice?
+
+  rentals     Rental[]
+  work_orders WorkOrder[]
+  damages     Damage[]
+}
+
+model VehicleRentalPrice {
+  id             String  @id @default(uuid())
+  vehicle_id     String  @unique
+  price_day      Decimal @db.Decimal(10, 2)
+  price_week     Decimal @db.Decimal(10, 2)
+  price_month    Decimal @db.Decimal(10, 2)
+  deposit_amount Decimal @db.Decimal(10, 2)
+
+  vehicle Vehicle @relation(fields: [vehicle_id], references: [id])
+}
+
+enum DepositStatus {
+  COLLECTED
+  RETURNED
+  RETAINED
+  PENDING
+}
+
+model Rental {
+  id               String        @id @default(uuid())
+  vehicle_id       String
+  client_id        String
+  start_date       DateTime
+  end_date_planned DateTime
+  end_date_actual  DateTime?
+  total_price      Decimal?      @db.Decimal(10, 2)
+  deposit_status   DepositStatus @default(PENDING)
+  created_at       DateTime      @default(now())
+  updated_at       DateTime      @updatedAt
+
+  vehicle Vehicle @relation(fields: [vehicle_id], references: [id])
+  client  Client  @relation(fields: [client_id], references: [id])
+
+  protocols Protocol[]
+  invoices  Invoice[]
+}
+
+enum ProtocolType {
+  HANDOVER
+  RETURN
+}
+
+model Protocol {
+  id              String       @id @default(uuid())
+  rental_id       String?
+  work_order_id   String?
+  type            ProtocolType
+  condition_notes String?      @db.Text
+  created_by      String
+  created_at      DateTime     @default(now())
+
+  rental     Rental?    @relation(fields: [rental_id], references: [id])
+  work_order WorkOrder? @relation(fields: [work_order_id], references: [id])
+  creator    User       @relation(fields: [created_by], references: [id])
+
+  damages Damage[]
+}
+
+model Damage {
+  id          String   @id @default(uuid())
+  vehicle_id  String
+  protocol_id String
+  description String   @db.Text
+  is_repaired Boolean  @default(false)
+  repair_cost Decimal? @db.Decimal(10, 2)
+  created_at  DateTime @default(now())
+
+  vehicle  Vehicle  @relation(fields: [vehicle_id], references: [id])
+  protocol Protocol @relation(fields: [protocol_id], references: [id])
+}
+
+// ==========================================
+// 4. Moduł Warsztatowy
+// ==========================================
+
+enum WorkOrderType {
+  TUV
+  UVV
+  KUNDENDIENST
+  REPAIR
+}
+
+enum WorkOrderStatus {
+  ACCEPTED
+  IN_PROGRESS
+  PAUSED
+  WAITING_FOR_PARTS
+  READY
+  COMPLETED
+}
+
+model WorkOrder {
+  id         String          @id @default(uuid())
+  vehicle_id String
+  client_id  String? // NULL dla naprawy wewnętrznej kosztowej
+  type       WorkOrderType
+  status     WorkOrderStatus @default(ACCEPTED)
+  created_at DateTime        @default(now())
+  updated_at DateTime        @updatedAt
+
+  vehicle Vehicle @relation(fields: [vehicle_id], references: [id])
+  client  Client? @relation(fields: [client_id], references: [id])
+
+  mechanics     WorkOrderMechanic[]
+  time_logs     TimeLog[]
+  part_requests PartRequest[]
+  parts_used    WorkOrderPart[]
+  protocols     Protocol[]
+  invoices      Invoice[]
+}
+
+model WorkOrderMechanic {
+  work_order_id    String
+  user_id          String
+  is_lead_mechanic Boolean @default(false)
+
+  work_order WorkOrder @relation(fields: [work_order_id], references: [id])
+  mechanic   User      @relation(fields: [user_id], references: [id])
+
+  // Złożony klucz główny (relacja M:N)
+  @@id([work_order_id, user_id])
+}
+
+enum TimeLogStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+model TimeLog {
+  id            String        @id @default(uuid())
+  work_order_id String
+  mechanic_id   String
+  start_time    DateTime      @default(now())
+  end_time      DateTime?
+  status        TimeLogStatus @default(ACTIVE)
+
+  work_order WorkOrder @relation(fields: [work_order_id], references: [id])
+  mechanic   User      @relation(fields: [mechanic_id], references: [id])
+}
+
+enum PartRequestStatus {
+  REPORTED
+  ORDERED
+  DELIVERED
+}
+
+model PartRequest {
+  id                  String            @id @default(uuid())
+  work_order_id       String
+  mechanic_id         String
+  requested_item_name String
+  item_type           String?
+  description         String?           @db.Text
+  status              PartRequestStatus @default(REPORTED)
+  created_at          DateTime          @default(now())
+
+  work_order WorkOrder @relation(fields: [work_order_id], references: [id])
+  mechanic   User      @relation(fields: [mechanic_id], references: [id])
+}
+
+// ==========================================
+// 5. Magazyn (Części i Narzędzia)
+// ==========================================
+
+model InventoryCategory {
+  id   String @id @default(uuid())
+  name String @unique
+
+  items Inventory[]
+}
+
+model Inventory {
+  id                 String   @id @default(uuid())
+  category_id        String
+  name               String
+  sku_code           String   @unique
+  stock_quantity     Int      @default(0)
+  purchase_price_net Decimal  @db.Decimal(10, 2)
+  selling_price_net  Decimal  @db.Decimal(10, 2)
+  updated_at         DateTime @updatedAt
+
+  category InventoryCategory @relation(fields: [category_id], references: [id])
+
+  work_order_parts WorkOrderPart[]
+}
+
+model WorkOrderPart {
+  id                String   @id @default(uuid())
+  work_order_id     String
+  inventory_id      String
+  quantity_used     Int
+  charged_price_net Decimal  @db.Decimal(10, 2) // Zablokowana cena w momencie użycia
+  created_at        DateTime @default(now())
+
+  work_order WorkOrder @relation(fields: [work_order_id], references: [id])
+  inventory  Inventory @relation(fields: [inventory_id], references: [id])
+}
+
+// ==========================================
+// 6. Multimedia (Uniwersalne Archiwum)
+// ==========================================
+
+enum FileType {
+  IMAGE
+  VIDEO
+  PDF
+}
+
+model MediaFile {
+  id          String   @id @default(uuid())
+  file_url    String
+  file_type   FileType
+  entity_type String // np. 'WorkOrder', 'Protocol', 'PartRequest', 'Vehicle'
+  entity_id   String // ID podpiętego rekordu (np. id zlecenia)
+  uploaded_by String
+  created_at  DateTime @default(now())
+
+  uploader User @relation(fields: [uploaded_by], references: [id])
+
+  // Indeks dla zapytań polimorficznych
+  @@index([entity_type, entity_id])
+}
+
+// ==========================================
+// 7. Finanse i Niemiecka Księgowość (Zgodność GoBD)
+// ==========================================
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  CANCELLED
+}
+
+model Invoice {
+  id             String        @id @default(uuid())
+  invoice_number String        @unique // Ścisła numeracja, np. RE-2026-05-001
+  client_id      String
+  work_order_id  String?
+  rental_id      String?
+  total_net      Decimal       @db.Decimal(10, 2)
+  total_vat      Decimal       @db.Decimal(10, 2)
+  total_gross    Decimal       @db.Decimal(10, 2)
+  status         InvoiceStatus @default(DRAFT)
+  created_at     DateTime      @default(now())
+  issued_at      DateTime?
+
+  client     Client     @relation(fields: [client_id], references: [id])
+  work_order WorkOrder? @relation(fields: [work_order_id], references: [id])
+  rental     Rental?    @relation(fields: [rental_id], references: [id])
+
+  items    InvoiceItem[]
+  payments Payment[]
+}
+
+model InvoiceItem {
+  id          String  @id @default(uuid())
+  invoice_id  String
+  description String
+  quantity    Decimal @db.Decimal(10, 2)
+  unit_price  Decimal @db.Decimal(10, 2)
+  vat_rate    Decimal @db.Decimal(5, 2) // Np. 19.00, 7.00, 0.00 (zgodnie z UStG)
+
+  invoice Invoice @relation(fields: [invoice_id], references: [id])
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  TRANSFER
+}
+
+model Payment {
+  id             String        @id @default(uuid())
+  invoice_id     String
+  amount_paid    Decimal       @db.Decimal(10, 2)
+  payment_method PaymentMethod
+  date           DateTime      @default(now())
+
+  invoice Invoice @relation(fields: [invoice_id], references: [id])
+}
+
+model LexwareExport {
+  id               String   @id @default(uuid())
+  date_range_start DateTime
+  date_range_end   DateTime
+  exported_at      DateTime @default(now())
+  file_hash        String   @unique
+}
